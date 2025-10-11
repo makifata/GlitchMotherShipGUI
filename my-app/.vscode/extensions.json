@@ -1,0 +1,21 @@
+{
+  "recommendations": [
+    "esbenp.prettier-vscode",
+    "bradlc.vscode-tailwindcss",
+    "ms-vscode.vscode-typescript-next",
+    "formulahendry.auto-rename-tag",
+    "christian-kohler.path-intellisense",
+    "ms-vscode.vscode-json",
+    "usernamehw.errorlens",
+    "ms-vscode.sublime-keybindings",
+    "ms-vscode-remote.remote-containers",
+    "ms-vscode.vscode-eslint",
+    "chakrounanas.turbo-console-log",
+    "gruntfuggly.todo-tree",
+    "ritwickdey.liveserver",
+    "ms-vscode.hexeditor",
+    "ms-vscode.vscode-react-javascript-snippets",
+    "dsznajder.es7-react-js-snippets",
+    "ms-vscode.vscode-typescript-next"
+  ]
+}
