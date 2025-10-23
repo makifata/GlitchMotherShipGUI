@@ -1,28 +1,20 @@
 import { Button } from '@/components/ui/button';
-import { useState } from 'react';
 import './App.css';
 import BinaryFileViewer from './components/BinaryFileViewer';
 import COMPortSelect from './components/COMPortSelect';
 import GCPCommunication from './components/GCPCommunication';
 import ProgressBarComponent from './components/ProgressBarComponent';
 import TauriIntegrationComponent from './components/TauriIntegrationComponent';
+import {
+  ConnectionProvider,
+  useConnection,
+} from './contexts/ConnectionContext';
 
-function App() {
+function AppContent() {
   // Theme Control - Change this to switch between light and dark mode
   const isDarkMode = true; // Set to false for light mode, true for dark mode
 
-  const [isConnected, setIsConnected] = useState(false);
-  const [connectedPort, setConnectedPort] = useState<string>('');
-
-  const handleConnect = (portName: string) => {
-    setConnectedPort(portName);
-    setIsConnected(true);
-  };
-
-  const handleDisconnect = () => {
-    setIsConnected(false);
-    setConnectedPort('');
-  };
+  const { isConnected, connectedPort, disconnect } = useConnection();
 
   // Show COM Port Selection Screen
   if (!isConnected) {
@@ -36,7 +28,7 @@ function App() {
               Glitchi Mothership
             </h1>
           </div>
-          <COMPortSelect onConnect={handleConnect} />
+          <COMPortSelect />
         </div>
       </div>
     );
@@ -47,18 +39,14 @@ function App() {
     <div className="App bg-gradient-to-br from-blue-50 to-indigo-100 min-h-screen">
       <header className="app-header pt-8 pb-4">
         <h1 className="text-4xl font-bold text-gray-800 mb-4 bg-gradient-to-r from-blue-600 to-purple-600 bg-clip-text text-transparent">
-          GlitchMothership GUI - Demo Mode
+          GlitchMothership GUI
         </h1>
         <p className="text-lg text-gray-600 max-w-2xl mx-auto">
           Connected to {connectedPort} - Tauri + React + TypeScript + Tailwind
           CSS + shadcn/ui
         </p>
         <div className="flex gap-4 justify-center mt-6">
-          <Button variant="default">Default Button</Button>
-          <Button variant="secondary">Secondary Button</Button>
-          <Button variant="outline">Outline Button</Button>
-          <Button variant="ghost">Ghost Button</Button>
-          <Button variant="destructive" onClick={handleDisconnect}>
+          <Button variant="destructive" onClick={disconnect}>
             Disconnect
           </Button>
         </div>
@@ -171,6 +159,14 @@ function App() {
         }
       `}</style>
     </div>
+  );
+}
+
+function App() {
+  return (
+    <ConnectionProvider>
+      <AppContent />
+    </ConnectionProvider>
   );
 }
 

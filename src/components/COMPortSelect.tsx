@@ -7,10 +7,11 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select';
-import { getEnvironment, safeInvoke } from '@/lib/tauriUtils';
-import { useEffect, useState } from 'react';
+import { useConnection } from '@/contexts/ConnectionContext';
+import { useState } from 'react';
 
-interface COMPortInfo {
+// Import the COMPort type from the context
+type COMPort = {
   port: string;
   description: string;
   manufacturer?: string;
@@ -18,142 +19,26 @@ interface COMPortInfo {
   vendor_id?: number;
   product_id?: number;
   port_type: string;
-}
-
-interface COMPort extends COMPortInfo {
   status: 'available' | 'busy' | 'connected';
-}
+};
 
-interface COMPortSelectProps {
-  onConnect?: (portName: string) => void;
-}
+const COMPortSelect = () => {
+  const {
+    availablePorts,
+    connectionStatus,
+    isScanning,
+    error,
+    isDemoMode,
+    connect,
+    refreshPorts,
+    clearError,
+  } = useConnection();
 
-const COMPortSelect = ({ onConnect }: COMPortSelectProps) => {
-  const [availablePorts, setAvailablePorts] = useState<COMPort[]>([]);
   const [selectedPort, setSelectedPort] = useState<string>('');
-  const [connectionStatus, setConnectionStatus] = useState<
-    'disconnected' | 'connecting' | 'connected'
-  >('disconnected');
-  const [isScanning, setIsScanning] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [isDemoMode, setIsDemoMode] = useState(false);
-  const environment = getEnvironment();
-
-  // Mock COM ports data for demo mode
-  const mockPorts: COMPort[] = [
-    {
-      port: 'COM1',
-      description: 'Communications Port (COM1)',
-      manufacturer: 'Generic',
-      serial_number: 'SN001',
-      vendor_id: 0x1234,
-      product_id: 0x5678,
-      port_type: 'Physical',
-      status: 'available',
-    },
-    {
-      port: 'COM3',
-      description: 'USB Serial Port (COM3)',
-      manufacturer: 'FTDI',
-      serial_number: 'FT123456',
-      vendor_id: 0x0403,
-      product_id: 0x6001,
-      port_type: 'USB',
-      status: 'available',
-    },
-    {
-      port: 'COM4',
-      description: 'Arduino Uno (COM4)',
-      manufacturer: 'Arduino LLC',
-      serial_number: 'AR789012',
-      vendor_id: 0x2341,
-      product_id: 0x0043,
-      port_type: 'USB',
-      status: 'available',
-    },
-  ];
-
-  useEffect(() => {
-    // Log environment info for debugging
-    console.log('Environment detection:', {
-      environment,
-      isDemoMode,
-      windowTauri:
-        typeof window !== 'undefined' ? '__TAURI__' in window : false,
-      windowTauriInternals:
-        typeof window !== 'undefined' ? '__TAURI_INTERNALS__' in window : false,
-      userAgent:
-        typeof window !== 'undefined' ? window.navigator.userAgent : 'unknown',
-      location:
-        typeof window !== 'undefined' ? window.location.href : 'unknown',
-    });
-
-    // Scan for ports on component mount
-    scanPorts();
-  }, []);
-
-  const scanPorts = async () => {
-    setIsScanning(true);
-    setError(null);
-
-    try {
-      // Try to use Tauri invoke first
-      const ports: COMPortInfo[] = await safeInvoke('list_com_ports');
-
-      // Convert to COMPort format with status
-      const portsWithStatus: COMPort[] = ports.map(port => ({
-        ...port,
-        status: 'available' as const,
-      }));
-
-      setAvailablePorts(portsWithStatus);
-      setIsDemoMode(false);
-    } catch (err) {
-      // If Tauri is not available, switch to demo mode
-      console.log('Tauri not available, switching to demo mode:', err);
-      setIsDemoMode(true);
-
-      // Simulate async port scanning for demo
-      await new Promise(resolve => setTimeout(resolve, 1000));
-      setAvailablePorts(mockPorts);
-      setError(null); // Clear error in demo mode
-    } finally {
-      setIsScanning(false);
-    }
-  };
 
   const handleConnect = async () => {
     if (!selectedPort) return;
-
-    setConnectionStatus('connecting');
-
-    // Simulate connection attempt (replace with actual connection logic later)
-    await new Promise(resolve => setTimeout(resolve, 2000));
-
-    // Update port status to connected
-    setAvailablePorts(ports =>
-      ports.map(port =>
-        port.port === selectedPort ? { ...port, status: 'connected' } : port
-      )
-    );
-
-    setConnectionStatus('connected');
-
-    // Call the onConnect callback to notify parent component
-    if (onConnect) {
-      onConnect(selectedPort);
-    }
-  };
-
-  const handleDisconnect = async () => {
-    setConnectionStatus('disconnected');
-
-    // Update port status back to available
-    setAvailablePorts(ports =>
-      ports.map(port =>
-        port.port === selectedPort ? { ...port, status: 'available' } : port
-      )
-    );
+    await connect(selectedPort);
   };
 
   const getStatusBadge = (status: COMPort['status']) => {
@@ -233,7 +118,7 @@ const COMPortSelect = ({ onConnect }: COMPortSelectProps) => {
               variant="secondary"
               size="sm"
               className="transparent-button"
-              onClick={scanPorts}
+              onClick={refreshPorts}
               disabled={isScanning}
             >
               {isScanning ? 'Scanning...' : 'Refresh'}
