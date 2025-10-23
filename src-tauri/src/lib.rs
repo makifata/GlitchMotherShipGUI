@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serialport::{SerialPortInfo, SerialPortType};
 
 mod gcp;
-use gcp::{GcpUartHandler, GcpStatusData};
+use gcp::{GcpUartHandler, GcpStatusData, GcpFwVersionData, GcpHardwareData, ConnectionState, connect_to_port, disconnect_from_port, get_connection_status, execute_with_connection};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct COMPortInfo {
@@ -114,16 +114,40 @@ fn format_port_type(port_type: &SerialPortType) -> String {
     }
 }
 
+// Connection Management Commands
 #[tauri::command]
-fn gcp_send_hello(port_name: String) -> Result<GcpStatusData, String> {
-    let mut handler = GcpUartHandler::new(&port_name)?;
-    handler.send_hello()
+fn connect_port(port_name: String) -> Result<String, String> {
+    connect_to_port(port_name)
+}
+
+#[tauri::command]
+fn disconnect_port(port_name: String) -> Result<String, String> {
+    disconnect_from_port(port_name)
+}
+
+#[tauri::command]
+fn get_port_connection_status(port_name: String) -> Result<String, String> {
+    match get_connection_status(port_name)? {
+        ConnectionState::Connected => Ok("Connected".to_string()),
+        ConnectionState::Disconnected => Ok("Disconnected".to_string()),
+        ConnectionState::Error(msg) => Ok(format!("Error: {}", msg)),
+    }
+}
+
+// GCP Commands using persistent connections
+#[tauri::command]
+fn gcp_send_hello(port_name: String) -> Result<GcpHardwareData, String> {
+    execute_with_connection(&port_name, |handler| handler.send_hello())
 }
 
 #[tauri::command]
 fn gcp_get_status(port_name: String) -> Result<GcpStatusData, String> {
-    let mut handler = GcpUartHandler::new(&port_name)?;
-    handler.get_status()
+    execute_with_connection(&port_name, |handler| handler.get_status())
+}
+
+#[tauri::command]
+fn gcp_get_fw_version(port_name: String) -> Result<GcpFwVersionData, String> {
+    execute_with_connection(&port_name, |handler| handler.get_fw_version())
 }
 
 #[tauri::command]
@@ -341,8 +365,12 @@ pub fn run() {
         analyze_bin_file,
         list_com_ports,
         get_port_info,
+        connect_port,
+        disconnect_port,
+        get_port_connection_status,
         gcp_send_hello,
-        gcp_get_status
+        gcp_get_status,
+        gcp_get_fw_version
     ])
     .run(tauri::generate_context!())
     .expect("error while running tauri application");

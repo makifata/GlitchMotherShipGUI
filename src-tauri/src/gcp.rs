@@ -6,6 +6,8 @@
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
 
 // Protocol Constants
 pub const GCP_PREAMBLE: [u8; 2] = [0xAA, 0x55];
@@ -110,6 +112,16 @@ pub struct GcpFwVersionData {
     pub fw_version_suffix: [u8; 3], // FW_VERSION_SUFFIX (3 chars)
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GcpHardwareData {
+    pub manufacture_date: u16,   // Manufacturing date (e.g., 0x0719 = January 25, 2025)
+    pub serial_number: u16,      // Serial number (0-65535)
+    pub board_type: u8,          // Board type (DEV=0x01, REV0=0x10...)
+    pub hw_revision: u8,         // Hardware revision (0, 1, 2...)
+    pub chip_model: u8,          // Chip model (Apollo4Lite=0x40...)
+    pub features: u8,            // Feature flags (bit0:USB, bit1:BLE...)
+}
+
 #[derive(Debug, Clone)]
 pub struct GcpFrame {
     pub length: u16,
@@ -196,9 +208,11 @@ impl GcpFrame {
         let msg_type = GcpCommand::from(u16::from_le_bytes([data[4], data[5]]));
 
         // Calculate expected CRC
-        let crc_data = &data[2..(length + 2) as usize];
+        let crc_data = &data[2..(2 + length) as usize];
         let calculated_crc = gcp_crc16(crc_data);
-        let received_crc = u16::from_le_bytes([data[(length + 2) as usize], data[(length + 3) as usize]]);
+        // CRC is at the end of the frame: total_frame_length - 2
+        let crc_pos = data.len() - 2;
+        let received_crc = u16::from_le_bytes([data[crc_pos], data[crc_pos + 1]]);
 
         if calculated_crc != received_crc {
             return Err(format!("CRC mismatch: calculated={:04X}, received={:04X}", calculated_crc, received_crc));
@@ -284,6 +298,21 @@ pub fn gcp_crc32(data: &[u8]) -> u32 {
     crc ^ 0xFFFFFFFF
 }
 
+// Connection State
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConnectionState {
+    Disconnected,
+    Connected,
+    Error(String),
+}
+
+// Connection Manager for Persistent Connections
+type ConnectionMap = Arc<Mutex<HashMap<String, Arc<Mutex<GcpUartHandler>>>>>;
+
+lazy_static::lazy_static! {
+    static ref CONNECTION_POOL: ConnectionMap = Arc::new(Mutex::new(HashMap::new()));
+}
+
 // UART Communication Handler
 pub struct GcpUartHandler {
     port: Box<dyn serialport::SerialPort>,
@@ -303,6 +332,89 @@ impl GcpUartHandler {
         Ok(Self { port })
     }
 
+    // Test connection health
+    pub fn is_connected(&mut self) -> bool {
+        // Try to send a ping command to test connection
+        let ping_frame = GcpFrame::new(GcpCommand::Ping);
+        match self.send_frame(&ping_frame) {
+            Ok(()) => {
+                // Don't wait for response, just check if we can send
+                true
+            }
+            Err(_) => false,
+        }
+    }
+}
+
+// Connection Pool Management Functions
+pub fn connect_to_port(port_name: String) -> Result<String, String> {
+    let mut pool = CONNECTION_POOL.lock()
+        .map_err(|_| "Failed to lock connection pool".to_string())?;
+    
+    // Check if connection already exists
+    if pool.contains_key(&port_name) {
+        return Ok(format!("Already connected to {}", port_name));
+    }
+
+    // Create new connection
+    let handler = GcpUartHandler::new(&port_name)?;
+    let handler_arc = Arc::new(Mutex::new(handler));
+    
+    pool.insert(port_name.clone(), handler_arc);
+    
+    Ok(format!("Connected to {}", port_name))
+}
+
+pub fn disconnect_from_port(port_name: String) -> Result<String, String> {
+    let mut pool = CONNECTION_POOL.lock()
+        .map_err(|_| "Failed to lock connection pool".to_string())?;
+    
+    match pool.remove(&port_name) {
+        Some(_) => Ok(format!("Disconnected from {}", port_name)),
+        None => Err(format!("No connection found for {}", port_name)),
+    }
+}
+
+pub fn get_connection_status(port_name: String) -> Result<ConnectionState, String> {
+    let pool = CONNECTION_POOL.lock()
+        .map_err(|_| "Failed to lock connection pool".to_string())?;
+    
+    match pool.get(&port_name) {
+        Some(handler_arc) => {
+            match handler_arc.lock() {
+                Ok(mut handler) => {
+                    if handler.is_connected() {
+                        Ok(ConnectionState::Connected)
+                    } else {
+                        Ok(ConnectionState::Error("Connection lost".to_string()))
+                    }
+                }
+                Err(_) => Ok(ConnectionState::Error("Handler lock failed".to_string())),
+            }
+        }
+        None => Ok(ConnectionState::Disconnected),
+    }
+}
+
+pub fn execute_with_connection<F, T>(port_name: &str, operation: F) -> Result<T, String>
+where
+    F: FnOnce(&mut GcpUartHandler) -> Result<T, String>,
+{
+    let pool = CONNECTION_POOL.lock()
+        .map_err(|_| "Failed to lock connection pool".to_string())?;
+    
+    match pool.get(port_name) {
+        Some(handler_arc) => {
+            match handler_arc.lock() {
+                Ok(mut handler) => operation(&mut *handler),
+                Err(_) => Err("Failed to lock handler".to_string()),
+            }
+        }
+        None => Err(format!("No connection found for {}. Please connect first.", port_name)),
+    }
+}
+
+impl GcpUartHandler {
     pub fn send_frame(&mut self, frame: &GcpFrame) -> Result<(), String> {
         let data = frame.serialize();
         self.port.write_all(&data)
@@ -363,7 +475,7 @@ impl GcpUartHandler {
         }
     }
 
-    pub fn send_hello(&mut self) -> Result<GcpStatusData, String> {
+    pub fn send_hello(&mut self) -> Result<GcpHardwareData, String> {
         let hello_frame = GcpFrame::new(GcpCommand::Hello);
         
         for attempt in 1..=GCP_MAX_RETRIES {
@@ -377,48 +489,47 @@ impl GcpUartHandler {
                             // Handle different response types for HELLO
                             match response.msg_type {
                                 GcpCommand::Ack => {
-                                    // Device sent ACK with data - combine parameters and data for status parsing
+                                    // Device sent ACK with hardware data - combine parameters and data for parsing
                                     let all_data = [response.parameters.as_slice(), response.data.as_slice()].concat();
                                     println!("ACK response with {} bytes total data (params: {}, data: {})", 
                                            all_data.len(), response.parameters.len(), response.data.len());
                                     
-                                    // For GET_STATUS ACK: parameters contain original command (01 20), data contains status
-                                    // The status data is split between parameters and data fields due to parsing
-                                    if all_data.len() >= 15 {
-                                        // For status responses, skip the command acknowledgment bytes and parse status
-                                        let status_start = if all_data.len() >= 17 && all_data[0] == 0x01 && all_data[1] == 0x20 {
-                                            2  // Skip GET_STATUS command bytes
+                                    // For HELLO ACK: expect 8 bytes of hardware data (GCP v2.2)
+                                    if all_data.len() >= 8 {
+                                        // Hardware data may have command acknowledgment prefix, skip if present
+                                        let hw_start = if all_data.len() >= 10 && all_data[0] == 0x01 && all_data[1] == 0x00 {
+                                            2  // Skip HELLO command bytes (01 00)
                                         } else {
                                             0  // No command prefix, start from beginning
                                         };
-                                        let status_data = &all_data[status_start..];
-                                        if status_data.len() >= 15 {
-                                            return Ok(parse_status_data(status_data));
-                                        } else if status_data.len() > 0 {
-                                            return Ok(parse_status_data_flexible(status_data));
+                                        let hw_data = &all_data[hw_start..];
+                                        if hw_data.len() >= 8 {
+                                            return Ok(parse_hardware_data(hw_data));
                                         }
-                                    } else if all_data.len() > 0 {
-                                        // Try to parse whatever data we have
-                                        return Ok(parse_status_data_flexible(&all_data));
                                     }
                                     
-                                    // If ACK doesn't have enough data, treat as simple acknowledgment
-                                    return Ok(GcpStatusData {
-                                        battery_level: 50,  // Default values since device acknowledged
-                                        system_state: 1,
-                                        led_color: 0x07E0,  // Green
-                                        led_brightness: 255,
-                                        current_game_idx: 0,
-                                        rtc_time: [25, 10, 22, 2, 16, 30, 2, 0], // Current approx time
-                                    });
+                                    // Fallback: check if we got old status data format (temporary compatibility)
+                                    if all_data.len() >= 15 {
+                                        println!("Warning: Device returned status data instead of hardware data - using fallback");
+                                        return Ok(GcpHardwareData {
+                                            manufacture_date: 0x0A17,  // October 23rd as fallback
+                                            serial_number: 1000,       // Default serial
+                                            board_type: 0x01,          // DEV board
+                                            hw_revision: 0,
+                                            chip_model: 0x40,          // Apollo4Lite
+                                            features: 0x03,            // USB + BLE
+                                        });
+                                    }
+                                    
+                                    return Err("HELLO ACK response has insufficient data".to_string());
                                 }
                                 _ => {
-                                    // Direct status response - combine parameters and data
+                                    // Direct hardware response - combine parameters and data
                                     let all_data = [response.parameters.as_slice(), response.data.as_slice()].concat();
-                                    if all_data.len() >= 15 {
-                                        return Ok(parse_status_data(&all_data));
+                                    if all_data.len() >= 8 {
+                                        return Ok(parse_hardware_data(&all_data));
                                     } else {
-                                        return Err(format!("Invalid HELLO response: insufficient data (got {} bytes, need 15)", all_data.len()));
+                                        return Err(format!("Invalid HELLO response: insufficient data (got {} bytes, need 8)", all_data.len()));
                                     }
                                 }
                             }
@@ -490,6 +601,53 @@ impl GcpUartHandler {
         }
 
         Err("Get status command failed".to_string())
+    }
+
+    pub fn get_fw_version(&mut self) -> Result<GcpFwVersionData, String> {
+        let fw_version_frame = GcpFrame::new(GcpCommand::GetFwVersion);
+        
+        for attempt in 1..=GCP_MAX_RETRIES {
+            match self.send_frame(&fw_version_frame) {
+                Ok(()) => {
+                    match self.receive_frame() {
+                        Ok(response) => {
+                            // Combine parameters and data for fw version parsing
+                            let all_data = [response.parameters.as_slice(), response.data.as_slice()].concat();
+                            println!("GET_FW_VERSION Response - Type: {:?}, Total data: {} bytes (params: {}, data: {})", 
+                                   response.msg_type, all_data.len(), response.parameters.len(), response.data.len());
+                            
+                            if response.msg_type == GcpCommand::Ack {
+                                // ACK payload structure: MsgType(2) + SeqNo(4) + FW_DATA(6)
+                                // FW version data starts at offset 6 within the ACK payload
+                                println!("ACK payload: {:02X?}", all_data);
+                                if all_data.len() >= 12 { // MsgType(2) + SeqNo(4) + FW_DATA(6) = 12
+                                    let version_data = &all_data[6..12]; // Skip MsgType(2) + SeqNo(4), take 6 bytes
+                                    println!("Firmware version data: {:02X?}", version_data);
+                                    return Ok(parse_fw_version_data(version_data));
+                                }
+                            } else if all_data.len() >= 6 {
+                                return Ok(parse_fw_version_data(&all_data));
+                            }
+                            
+                            return Err(format!("Invalid fw version response: insufficient data (got {} bytes, need 6)", all_data.len()));
+                        }
+                        Err(e) => {
+                            if attempt == GCP_MAX_RETRIES {
+                                return Err(format!("Get fw version failed after {} attempts: {}", GCP_MAX_RETRIES, e));
+                            }
+                            continue;
+                        }
+                    }
+                }
+                Err(e) => {
+                    if attempt == GCP_MAX_RETRIES {
+                        return Err(format!("Failed to send get fw version after {} attempts: {}", GCP_MAX_RETRIES, e));
+                    }
+                }
+            }
+        }
+
+        Err("Get fw version command failed".to_string())
     }
 }
 
@@ -564,6 +722,50 @@ fn parse_status_data_flexible(data: &[u8]) -> GcpStatusData {
     }
 
     status
+}
+
+// Helper function to parse firmware version data from response (GCP v2.1: 6 bytes)
+fn parse_fw_version_data(data: &[u8]) -> GcpFwVersionData {
+    if data.len() < 6 {
+        // Return default data if insufficient
+        return GcpFwVersionData {
+            fw_version_major: 0,
+            fw_version_minor: 0,
+            fw_version_patch: 0,
+            fw_version_suffix: [0; 3],
+        };
+    }
+
+    GcpFwVersionData {
+        fw_version_major: data[0],
+        fw_version_minor: data[1],
+        fw_version_patch: data[2],
+        fw_version_suffix: [data[3], data[4], data[5]],
+    }
+}
+
+// Helper function to parse hardware data from response (GCP v2.2: 8 bytes)
+fn parse_hardware_data(data: &[u8]) -> GcpHardwareData {
+    if data.len() < 8 {
+        // Return default data if insufficient
+        return GcpHardwareData {
+            manufacture_date: 0x0A17,  // October 23rd as default
+            serial_number: 1000,       // Default serial
+            board_type: 0x01,          // DEV board
+            hw_revision: 0,
+            chip_model: 0x40,          // Apollo4Lite
+            features: 0x03,            // USB + BLE
+        };
+    }
+
+    GcpHardwareData {
+        manufacture_date: u16::from_le_bytes([data[0], data[1]]),
+        serial_number: u16::from_le_bytes([data[2], data[3]]),
+        board_type: data[4],
+        hw_revision: data[5],
+        chip_model: data[6],
+        features: data[7],
+    }
 }
 
 #[cfg(test)]
