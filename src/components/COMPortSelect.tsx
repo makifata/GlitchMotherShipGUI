@@ -8,37 +8,38 @@ import {
   SelectValue,
 } from '@/components/ui/select';
 import { useConnection } from '@/contexts/ConnectionContext';
+import { useConnectionActions } from '@/hooks/useConnectionActions';
+import {
+  formatBoardTypeShort,
+  formatChipModelShort,
+  formatFeaturesSimple,
+  formatFirmwareVersion,
+  formatManufactureDate,
+} from '@/lib/formatters';
+import type { COMPort } from '@/types/ConnectionTypes';
 import { useState } from 'react';
 
-// Import the COMPort type from the context
-type COMPort = {
-  port: string;
-  description: string;
-  manufacturer?: string;
-  serial_number?: string;
-  vendor_id?: number;
-  product_id?: number;
-  port_type: string;
-  status: 'available' | 'busy' | 'connected';
-};
-
 const COMPortSelect = () => {
+  // Get data from context
   const {
     availablePorts,
     connectionStatus,
     isScanning,
     error,
     isDemoMode,
-    connect,
-    refreshPorts,
-    clearError,
+    hardwareInfo,
+    firmwareVersionInfo,
+    connectedPort,
   } = useConnection();
+
+  // Get actions from custom hook
+  const { connectToPort, refreshPorts, clearError } = useConnectionActions();
 
   const [selectedPort, setSelectedPort] = useState<string>('');
 
   const handleConnect = async () => {
     if (!selectedPort) return;
-    await connect(selectedPort);
+    await connectToPort(selectedPort);
   };
 
   const getStatusBadge = (status: COMPort['status']) => {
@@ -143,17 +144,17 @@ const COMPortSelect = () => {
         </div>
 
         {/* Connection Info */}
-        {connectionStatus === 'connected' && selectedPort && (
+        {connectionStatus === 'connected' && connectedPort && (
           <div className="p-4 bg-green-50 border border-green-200 rounded-md">
             <div className="text-sm">
-              <strong>Connected to:</strong> {selectedPort}
+              <strong>Connected to:</strong> {connectedPort}
               <br />
               <strong>Status:</strong> Ready for communication
               <br />
-              <strong>Baud Rate:</strong> 9600 (default)
+              <strong>Baud Rate:</strong> 115200
               {(() => {
                 const portInfo = availablePorts.find(
-                  p => p.port === selectedPort
+                  p => p.port === connectedPort
                 );
                 if (portInfo?.manufacturer) {
                   return (
@@ -165,6 +166,46 @@ const COMPortSelect = () => {
                 }
                 return null;
               })()}
+              {/* Hardware Information from HELLO command */}
+              {hardwareInfo && (
+                <>
+                  <hr className="my-2 border-green-300" />
+                  <div className="font-semibold text-green-800 mb-1">
+                    Hardware Information:
+                  </div>
+                  <strong>Serial Number:</strong> {hardwareInfo.serial_number}
+                  <br />
+                  <strong>Board Type:</strong>{' '}
+                  {formatBoardTypeShort(hardwareInfo.board_type)}
+                  <br />
+                  <strong>Hardware Revision:</strong> {hardwareInfo.hw_revision}
+                  <br />
+                  <strong>Chip Model:</strong>{' '}
+                  {formatChipModelShort(hardwareInfo.chip_model)}
+                  <br />
+                  <strong>Manufacturing Date:</strong>{' '}
+                  {formatManufactureDate(hardwareInfo.manufacture_date)}
+                  <br />
+                  <strong>Features:</strong>{' '}
+                  {formatFeaturesSimple(hardwareInfo.features)}
+                </>
+              )}
+              {/* Firmware Version Information from GET_FW_VERSION command */}
+              {firmwareVersionInfo && (
+                <>
+                  <hr className="my-2 border-green-300" />
+                  <div className="font-semibold text-green-800 mb-1">
+                    Firmware Information:
+                  </div>
+                  <strong>Firmware Version:</strong>{' '}
+                  {formatFirmwareVersion(firmwareVersionInfo)}
+                  <br />
+                  <strong>Version Details:</strong> v
+                  {firmwareVersionInfo.fw_version_major}.
+                  {firmwareVersionInfo.fw_version_minor}.
+                  {firmwareVersionInfo.fw_version_patch}
+                </>
+              )}
             </div>
           </div>
         )}

@@ -1,4 +1,13 @@
 import { useConnection } from '@/contexts/ConnectionContext';
+import { useConnectionActions } from '@/hooks/useConnectionActions';
+import {
+  formatBoardType,
+  formatChipModel,
+  formatFeatures,
+  formatLedColor,
+  formatManufactureDate,
+  formatTime,
+} from '@/lib/formatters';
 import React, { useEffect, useState } from 'react';
 import { Badge } from './ui/badge';
 import { Button } from './ui/button';
@@ -36,7 +45,8 @@ interface GCPHardwareData {
 }
 
 const GCPCommunication: React.FC = () => {
-  const { isConnected, connectedPort, invokeWithPort } = useConnection();
+  const { isConnected, connectedPort } = useConnection();
+  const { invokeGCPCommand } = useConnectionActions();
 
   const [isLoading, setIsLoading] = useState(false);
   const [statusData, setStatusData] = useState<GCPStatusData | null>(null);
@@ -49,6 +59,8 @@ const GCPCommunication: React.FC = () => {
   const [error, setError] = useState<string>('');
   const [isPolling, setIsPolling] = useState(false);
   const [pollingInterval, setPollingInterval] = useState<number | null>(null);
+  const [fwUpdateStatus, setFwUpdateStatus] = useState<string>('');
+  const [robustnessTestStatus, setRobustnessTestStatus] = useState<string>('');
 
   // Status polling functions
   const startStatusPolling = () => {
@@ -57,7 +69,9 @@ const GCPCommunication: React.FC = () => {
     setIsPolling(true);
     const interval = window.setInterval(async () => {
       try {
-        const response: GCPStatusData = await invokeWithPort('gcp_get_status');
+        const response: GCPStatusData = await invokeGCPCommand(
+          'gcp_get_status'
+        );
         setStatusData(response);
         setError('');
       } catch (err) {
@@ -108,7 +122,7 @@ const GCPCommunication: React.FC = () => {
     setHardwareData(null);
 
     try {
-      const response = await invokeWithPort('gcp_send_hello');
+      const response = await invokeGCPCommand('gcp_send_hello');
       console.log('HELLO Response (raw):', response);
 
       // Check if response has hardware data fields or status data fields
@@ -155,7 +169,7 @@ const GCPCommunication: React.FC = () => {
     setError('');
 
     try {
-      const response: GCPStatusData = await invokeWithPort('gcp_get_status');
+      const response: GCPStatusData = await invokeGCPCommand('gcp_get_status');
       setStatusData(response);
       console.log('Status Response:', response);
     } catch (err) {
@@ -176,7 +190,7 @@ const GCPCommunication: React.FC = () => {
     setError('');
 
     try {
-      const response: GCPFwVersionData = await invokeWithPort(
+      const response: GCPFwVersionData = await invokeGCPCommand(
         'gcp_get_fw_version'
       );
       setFwVersionData(response);
@@ -189,83 +203,102 @@ const GCPCommunication: React.FC = () => {
     }
   };
 
-  const formatTime = (time: number[]) => {
-    if (time.length < 6) return 'Invalid time';
-    const [year, month, day, hour, min, sec] = time;
-    return `20${year.toString().padStart(2, '0')}-${month
-      .toString()
-      .padStart(2, '0')}-${day.toString().padStart(2, '0')} ${hour
-      .toString()
-      .padStart(2, '0')}:${min.toString().padStart(2, '0')}:${sec
-      .toString()
-      .padStart(2, '0')}`;
-  };
+  const startFirmwareUpdate = async () => {
+    if (!isConnected) {
+      setError('Please connect to a COM port first');
+      return;
+    }
 
-  const formatLedColor = (color: number) => {
-    return `#${color.toString(16).padStart(4, '0')}`;
-  };
+    setIsLoading(true);
+    setError('');
+    setFwUpdateStatus('');
 
-  const formatManufactureDate = (date: number) => {
-    // Custom date format as per specification
-    // Example: 0x0719 = January 25, 2025 (implementation-specific encoding)
-    return `0x${date
-      .toString(16)
-      .padStart(4, '0')
-      .toUpperCase()} (Custom Format)`;
-  };
+    try {
+      // Import invoke directly
+      const { invoke } = await import('@tauri-apps/api/core');
 
-  const formatBoardType = (type: number) => {
-    switch (type) {
-      case 0x01:
-        return 'DEV (Development board)';
-      case 0x10:
-        return 'REV0 (Revision 0 production)';
-      case 0x11:
-        return 'REV1 (Revision 1 production)';
-      default:
-        return `Unknown (0x${type
-          .toString(16)
-          .padStart(2, '0')
-          .toUpperCase()})`;
+      // Create a test firmware payload (12 bytes for testing)
+      const testFirmware = new Uint8Array(12);
+      testFirmware.set([
+        0x48, 0x65, 0x6c, 0x6c, 0x6f, 0x20, 0x47, 0x43, 0x50, 0x21, 0x0a, 0x00,
+      ]);
+
+      setFwUpdateStatus('Starting firmware update...');
+      console.log(
+        'Starting firmware update with test payload:',
+        Array.from(testFirmware)
+      );
+
+      // Call Tauri command directly like working commands do
+      const response = await invoke<string>('gcp_start_firmware_update', {
+        portName: connectedPort,
+        firmwareData: Array.from(testFirmware),
+        chunkSize: 2036,
+      });
+
+      setFwUpdateStatus('Firmware update start acknowledged!');
+      console.log('Firmware Update Start Response:', response);
+    } catch (err) {
+      setError(`Firmware update start failed: ${err}`);
+      setFwUpdateStatus('Firmware update start failed');
+      console.error('Error starting firmware update:', err);
+    } finally {
+      setIsLoading(false);
     }
   };
 
-  const formatChipModel = (model: number) => {
-    switch (model) {
-      case 0x40:
-        return 'Apollo4Lite (no native USB)';
-      case 0x41:
-        return 'Apollo4Plus (with USB controller)';
-      default:
-        return `Unknown (0x${model
-          .toString(16)
-          .padStart(2, '0')
-          .toUpperCase()})`;
-    }
-  };
-
-  const formatFeatures = (features: number) => {
-    const featureList = [];
-    if (features & 0x01) featureList.push('NATIVE_USB');
-    if (features & 0x02) featureList.push('BLE');
-    if (features & 0x04) featureList.push('EXT_MRAM_A');
-    if (features & 0x08) featureList.push('EXT_MRAM_B');
-
-    const reserved = [];
-    if (features & 0x10) reserved.push('Bit4');
-    if (features & 0x20) reserved.push('Bit5');
-    if (features & 0x40) reserved.push('Bit6');
-    if (features & 0x80) reserved.push('Bit7');
-
-    let result = featureList.length > 0 ? featureList.join(', ') : 'None';
-    if (reserved.length > 0) {
-      result += ` (Reserved: ${reserved.join(', ')})`;
+  const runRobustnessTest = async () => {
+    if (!isConnected) {
+      setError('Please connect to a COM port first');
+      return;
     }
 
-    return `${result} [0x${features
-      .toString(16)
-      .padStart(2, '0')
-      .toUpperCase()}]`;
+    setIsLoading(true);
+    setError('');
+    setRobustnessTestStatus('');
+
+    let randomSize = 0;
+
+    try {
+      // Import invoke directly
+      const { invoke } = await import('@tauri-apps/api/core');
+
+      // Generate random payload size between 0-1024 bytes
+      randomSize = Math.floor(Math.random() * 1025); // 0-1024
+      const randomPayload = new Uint8Array(randomSize);
+
+      // Fill with random data
+      for (let i = 0; i < randomSize; i++) {
+        randomPayload[i] = Math.floor(Math.random() * 256);
+      }
+
+      setRobustnessTestStatus(`Testing ${randomSize}-byte packet...`);
+      console.log(
+        `Robustness test: sending ${randomSize} bytes of random data`
+      );
+      console.log(
+        'Random payload preview (first 16 bytes):',
+        Array.from(randomPayload.slice(0, 16))
+      );
+
+      // Call Tauri command directly like working commands do
+      const response = await invoke<string>('gcp_send_firmware_chunk', {
+        portName: connectedPort,
+        chunkData: Array.from(randomPayload),
+        sequenceNumber: randomSize,
+      });
+
+      setRobustnessTestStatus(
+        `✅ SUCCESS: ${randomSize}-byte packet transmitted and acknowledged!`
+      );
+      console.log('Robustness Test Response:', response);
+    } catch (err) {
+      setRobustnessTestStatus(`❌ FAILED: ${randomSize}-byte packet failed`);
+      setError(`Robustness test failed: ${err}`);
+      console.error('Error in robustness test:', err);
+    } finally {
+      setIsLoading(false);
+    }
   };
 
   return (
@@ -294,7 +327,7 @@ const GCPCommunication: React.FC = () => {
               <Button
                 onClick={sendHello}
                 disabled={isLoading || !isConnected}
-                className="bg-green-600 hover:bg-green-700"
+                variant="outline"
               >
                 {isLoading ? 'Sending...' : 'HELLO'}
               </Button>
@@ -308,9 +341,23 @@ const GCPCommunication: React.FC = () => {
               <Button
                 onClick={getFwVersion}
                 disabled={isLoading || !isConnected}
-                variant="secondary"
+                variant="outline"
               >
                 Get Firmware Version
+              </Button>
+              <Button
+                onClick={startFirmwareUpdate}
+                disabled={isLoading || !isConnected}
+                variant="outline"
+              >
+                {isLoading ? 'Updating...' : 'Test FW Update Start'}
+              </Button>
+              <Button
+                onClick={runRobustnessTest}
+                disabled={isLoading || !isConnected}
+                variant="outline"
+              >
+                {isLoading ? 'Testing...' : 'Random Packet Test (0-1024B)'}
               </Button>
             </div>
 
@@ -347,6 +394,32 @@ const GCPCommunication: React.FC = () => {
             <div className="p-4 bg-red-50 border border-red-200 rounded-md">
               <div className="flex">
                 <div className="text-sm text-red-600">{error}</div>
+              </div>
+            </div>
+          )}
+
+          {/* Firmware Update Status Display */}
+          {fwUpdateStatus && (
+            <div className="p-4 bg-blue-50 border border-blue-200 rounded-md">
+              <div className="flex items-center space-x-2">
+                <div className="text-sm text-blue-800 font-medium">
+                  Firmware Update:
+                </div>
+                <div className="text-sm text-blue-600">{fwUpdateStatus}</div>
+              </div>
+            </div>
+          )}
+
+          {/* Robustness Test Status Display */}
+          {robustnessTestStatus && (
+            <div className="p-4 bg-purple-50 border border-purple-200 rounded-md">
+              <div className="flex items-center space-x-2">
+                <div className="text-sm text-purple-800 font-medium">
+                  Robustness Test:
+                </div>
+                <div className="text-sm text-purple-600">
+                  {robustnessTestStatus}
+                </div>
               </div>
             </div>
           )}
@@ -414,7 +487,10 @@ const GCPCommunication: React.FC = () => {
                 <div className="grid grid-cols-2 gap-4 text-sm">
                   <div>
                     <strong>Manufacture Date:</strong>{' '}
-                    {formatManufactureDate(hardwareData.manufacture_date)}
+                    {formatManufactureDate(
+                      hardwareData.manufacture_date,
+                      'hex'
+                    )}
                   </div>
                   <div>
                     <strong>Serial Number:</strong> {hardwareData.serial_number}
@@ -528,6 +604,11 @@ const GCPCommunication: React.FC = () => {
               <div>
                 <strong>Hardware Fields:</strong> Manufacturing date, serial
                 number, board type, HW revision, chip model, feature flags
+              </div>
+              <div>
+                <strong>FW_UPDATE_START:</strong> Initiates firmware update with
+                12-byte test payload, sends frame parameters including size,
+                CRC32, and chunk size
               </div>
             </CardContent>
           </Card>

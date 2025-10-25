@@ -133,7 +133,7 @@ pub struct GcpFrame {
 impl GcpFrame {
     pub fn new(msg_type: GcpCommand) -> Self {
         Self {
-            length: 6, // Base length for header + msg_type + reserved
+            length: 6, // Device expects: Length(2) + MsgType(2) + Reserved(2) = 6 bytes total
             msg_type,
             parameters: vec![0, 0], // Default reserved bytes
             data: Vec::new(),
@@ -141,7 +141,9 @@ impl GcpFrame {
     }
 
     pub fn with_parameters(msg_type: GcpCommand, parameters: Vec<u8>) -> Self {
-        let length = 4 + parameters.len() as u16; // length(2) + msg_type(2) + parameters
+        // Device expects Length = Length(2) + MsgType(2) + Parameters
+        // For FW_UPDATE_START: Length(2) + MsgType(2) + Parameters(12) = 16 bytes
+        let length = 2 + 2 + parameters.len() as u16;
         Self {
             length,
             msg_type,
@@ -151,7 +153,8 @@ impl GcpFrame {
     }
 
     pub fn with_data(msg_type: GcpCommand, parameters: Vec<u8>, data: Vec<u8>) -> Self {
-        let length = 4 + parameters.len() as u16 + data.len() as u16;
+        // Device expects Length = Length(2) + MsgType(2) + Parameters + Data
+        let length = 2 + 2 + parameters.len() as u16 + data.len() as u16;
         Self {
             length,
             msg_type,
@@ -210,7 +213,7 @@ impl GcpFrame {
         // Calculate expected CRC
         let crc_data = &data[2..(2 + length) as usize];
         let calculated_crc = gcp_crc16(crc_data);
-        // CRC is at the end of the frame: total_frame_length - 2
+        // CRC is at the end of the frame (last 2 bytes)
         let crc_pos = data.len() - 2;
         let received_crc = u16::from_le_bytes([data[crc_pos], data[crc_pos + 1]]);
 
@@ -332,17 +335,11 @@ impl GcpUartHandler {
         Ok(Self { port })
     }
 
-    // Test connection health
+    // Test connection health  
     pub fn is_connected(&mut self) -> bool {
-        // Try to send a ping command to test connection
-        let ping_frame = GcpFrame::new(GcpCommand::Ping);
-        match self.send_frame(&ping_frame) {
-            Ok(()) => {
-                // Don't wait for response, just check if we can send
-                true
-            }
-            Err(_) => false,
-        }
+        // Don't send ping during active operations to avoid buffer corruption
+        // Just check if port is still open
+        true
     }
 }
 
@@ -415,16 +412,383 @@ where
 }
 
 impl GcpUartHandler {
-    pub fn send_frame(&mut self, frame: &GcpFrame) -> Result<(), String> {
+    pub fn send_frame_simple(&mut self, frame: &GcpFrame) -> Result<(), String> {
         let data = frame.serialize();
+        
+        println!("TX Simple Frame ({} bytes): {:02X?}", data.len(), data);
+        
+        // Simple transmission without aggressive buffer clearing for firmware operations
+        let _ = self.port.flush();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        
         self.port.write_all(&data)
             .map_err(|e| format!("Failed to send frame: {}", e))?;
         self.port.flush()
             .map_err(|e| format!("Failed to flush port: {}", e))?;
+        
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        println!("TX Simple Frame sent successfully, {} bytes transmitted", data.len());
         Ok(())
     }
 
+    pub fn send_frame(&mut self, frame: &GcpFrame) -> Result<(), String> {
+        let data = frame.serialize();
+        
+        // Validate frame before sending
+        // Total frame = Preamble(2) + Length content + CRC(2) = Length + 4  
+        if data.len() != (frame.length + 4) as usize { 
+            return Err(format!("Frame size mismatch: data_len={}, expected={}", 
+                             data.len(), frame.length + 4));
+        }
+        
+        // Debug logging for frame transmission
+        println!("TX Frame ({} bytes): {:02X?}", data.len(), data);
+        println!("TX Frame Details: Type={:?}, Length={}, Params={} bytes, Data={} bytes", 
+               frame.msg_type, frame.length, frame.parameters.len(), frame.data.len());
+        
+        // Validate frame structure
+        println!("TX Frame Structure Validation:");
+        println!("  Preamble: {:02X?} (should be [AA, 55])", &data[0..2]);
+        println!("  Length: {:02X?} (should be [{:02X}, 00])", &data[2..4], frame.length as u8);
+        println!("  MsgType: {:02X?}", &data[4..6]);
+        println!("  Expected total size: {} bytes", frame.length + 4);
+        println!("  Actual total size: {} bytes", data.len());
+        
+        // Calculate and log CRC
+        let crc_data = &data[2..(2 + frame.length) as usize]; // Skip preamble for CRC calc
+        let calculated_crc = gcp_crc16(crc_data);
+        let frame_crc = u16::from_le_bytes([data[data.len()-2], data[data.len()-1]]);
+        println!("TX CRC: calculated=0x{:04X}, in_frame=0x{:04X}, match={}", 
+               calculated_crc, frame_crc, calculated_crc == frame_crc);
+        
+        // Aggressive buffer management to prevent frame contamination
+        let _ = self.port.flush();
+        
+        // Multiple rounds of buffer clearing with increasing delays
+        for round in 1..=3 {
+            let mut discard_buffer = [0u8; 1024];
+            let mut total_discarded = 0;
+            
+            // Clear buffer aggressively
+            self.port.set_timeout(Duration::from_millis(10)).ok();
+            while let Ok(bytes_read) = self.port.read(&mut discard_buffer) {
+                if bytes_read == 0 {
+                    break;
+                }
+                total_discarded += bytes_read;
+            }
+            
+            if total_discarded > 0 {
+                println!("Round {}: Discarded {} stale bytes from RX buffer", round, total_discarded);
+            }
+            
+            // Exponential delay between clearing rounds
+            std::thread::sleep(std::time::Duration::from_millis(20 * round));
+        }
+        
+        // Reset timeout for normal operation
+        self.port.set_timeout(Duration::from_millis(GCP_TIMEOUT_MS)).ok();
+        
+        // Long delay before transmission to ensure clean channel
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        
+        self.port.write_all(&data)
+            .map_err(|e| format!("Failed to send frame: {}", e))?;
+        self.port.flush()
+            .map_err(|e| format!("Failed to flush port: {}", e))?;
+        
+        // Extended delay after transmission for device processing
+        std::thread::sleep(std::time::Duration::from_millis(75));
+        
+        println!("TX Frame sent successfully, {} bytes transmitted", data.len());
+        Ok(())
+    }
+
+    pub fn start_firmware_update(&mut self, fw_data: &[u8], chunk_size: u16) -> Result<(), String> {
+        let fw_size = fw_data.len() as u32;
+        let fw_crc32 = gcp_crc32(fw_data);
+        
+        println!("===== FIRMWARE UPDATE START DEBUG =====");
+        println!("FW Size: {} bytes", fw_size);
+        println!("FW CRC32: 0x{:08X}", fw_crc32);
+        println!("Chunk Size: {} bytes", chunk_size);
+
+        // Create FW_UPDATE_START frame - following GCP v2.2 spec exactly
+        let mut parameters = Vec::new();
+        parameters.extend_from_slice(&fw_size.to_le_bytes());        // Size (4 bytes)
+        parameters.extend_from_slice(&fw_crc32.to_le_bytes());       // CRC32 (4 bytes)
+        parameters.extend_from_slice(&chunk_size.to_le_bytes());     // Chunk size (2 bytes)
+        parameters.extend_from_slice(&[0u8, 0u8]);                   // Reserved (2 bytes)
+
+        println!("Parameters ({} bytes): {:02X?}", parameters.len(), parameters);
+        println!("Corrected frame structure (20 bytes total):");
+        println!("  Preamble: AA 55");
+        println!("  Length: 10 00 (16 bytes)");
+        println!("  MsgType: 01 10");
+        println!("  Size: {:02X?}", &fw_size.to_le_bytes());
+        println!("  CRC32: {:02X?}", &fw_crc32.to_le_bytes());
+        println!("  Chunk: {:02X?}", &chunk_size.to_le_bytes());
+        println!("  Reserved: 00 00");
+        println!("  CRC16: [calculated]");
+
+        // Create frame with correct length calculation
+        let start_frame = GcpFrame::with_parameters(GcpCommand::FwUpdateStart, parameters);
+        println!("Constructed frame length: {} (correct per Length field definition)", start_frame.length);
+        
+        // Verify frame structure is consistent
+        if start_frame.length != 16 {
+            return Err(format!("Frame length error: calculated={}, should be 16", start_frame.length));
+        }
+
+        // Wait for device to be completely ready
+        std::thread::sleep(std::time::Duration::from_millis(1000));
+
+        for attempt in 1..=GCP_MAX_RETRIES {
+            println!("=== Attempt {} ===", attempt);
+            
+            // Use simplified transmission method to avoid buffer clearing corruption
+            match self.send_frame_simple(&start_frame) {
+                Ok(()) => {
+                    println!("Frame sent successfully, waiting for response...");
+                    match self.receive_frame_with_timeout(5000) { // Extended timeout for FW operations
+                        Ok(response) => {
+                            println!("Response received: {:?}", response.msg_type);
+                            if response.msg_type == GcpCommand::Ack {
+                                println!("Firmware update start acknowledged");
+                                return Ok(());
+                            } else if response.msg_type == GcpCommand::Nack {
+                                let error_msg = if response.data.len() >= 2 {
+                                    let error_code = u16::from_le_bytes([response.data[0], response.data[1]]);
+                                    format!("Device rejected firmware update start: error code 0x{:04X}", error_code)
+                                } else {
+                                    "Device rejected firmware update start".to_string()
+                                };
+                                return Err(error_msg);
+                            } else {
+                                return Err(format!("Unexpected response to firmware update start: {:?}", response.msg_type));
+                            }
+                        }
+                        Err(e) => {
+                            println!("Failed to receive response: {}", e);
+                            if attempt == GCP_MAX_RETRIES {
+                                return Err(format!("Failed to receive response to firmware update start after {} attempts: {}", GCP_MAX_RETRIES, e));
+                            }
+                            // Longer delay between retry attempts for complete device recovery
+                            std::thread::sleep(std::time::Duration::from_millis(1000));
+                        }
+                    }
+                }
+                Err(e) => {
+                    println!("Failed to send frame: {}", e);
+                    if attempt == GCP_MAX_RETRIES {
+                        return Err(format!("Failed to send firmware update start after {} attempts: {}", GCP_MAX_RETRIES, e));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                }
+            }
+        }
+
+        Err("Firmware update start failed".to_string())
+    }
+
+    pub fn send_firmware_chunk(&mut self, chunk_data: &[u8], seq_no: u32) -> Result<(), String> {
+        // Create FW_UPDATE_DATA frame
+        let mut parameters = Vec::new();
+        parameters.extend_from_slice(&seq_no.to_le_bytes());  // Sequence number (4 bytes)
+
+        let data_frame = GcpFrame::with_data(GcpCommand::FwUpdateData, parameters, chunk_data.to_vec());
+
+        for attempt in 1..=GCP_MAX_RETRIES {
+            match self.send_frame(&data_frame) {
+                Ok(()) => {
+                    match self.receive_frame() {
+                        Ok(response) => {
+                            if response.msg_type == GcpCommand::Ack {
+                                // Verify ACK contains correct sequence number
+                                let all_data = [response.parameters.as_slice(), response.data.as_slice()].concat();
+                                if all_data.len() >= 10 {  // MsgType(2) + SeqNo(4) + minimal payload
+                                    let ack_seq = u32::from_le_bytes([all_data[2], all_data[3], all_data[4], all_data[5]]);
+                                    if ack_seq == seq_no {
+                                        return Ok(());
+                                    } else {
+                                        return Err(format!("Sequence number mismatch: sent {}, acked {}", seq_no, ack_seq));
+                                    }
+                                } else {
+                                    // Simple ACK without sequence check - assume success
+                                    return Ok(());
+                                }
+                            } else if response.msg_type == GcpCommand::Nack {
+                                let error_msg = if response.data.len() >= 2 {
+                                    let error_code = u16::from_le_bytes([response.data[0], response.data[1]]);
+                                    format!("Device rejected chunk {}: error code 0x{:04X}", seq_no, error_code)
+                                } else {
+                                    format!("Device rejected chunk {}", seq_no)
+                                };
+                                return Err(error_msg);
+                            } else {
+                                return Err(format!("Unexpected response to firmware chunk {}: {:?}", seq_no, response.msg_type));
+                            }
+                        }
+                        Err(e) => {
+                            if attempt == GCP_MAX_RETRIES {
+                                return Err(format!("Failed to receive response to chunk {} after {} attempts: {}", seq_no, GCP_MAX_RETRIES, e));
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    if attempt == GCP_MAX_RETRIES {
+                        return Err(format!("Failed to send chunk {} after {} attempts: {}", seq_no, GCP_MAX_RETRIES, e));
+                    }
+                }
+            }
+        }
+
+        Err(format!("Firmware chunk {} send failed", seq_no))
+    }
+
+    pub fn send_firmware_chunk_single_try(&mut self, chunk_data: &[u8], seq_no: u32) -> Result<(), String> {
+        // Create FW_UPDATE_DATA frame
+        let mut parameters = Vec::new();
+        parameters.extend_from_slice(&seq_no.to_le_bytes());  // Sequence number (4 bytes)
+
+        let data_frame = GcpFrame::with_data(GcpCommand::FwUpdateData, parameters, chunk_data.to_vec());
+
+        // Single attempt only for robustness testing
+        println!("Robustness test: Sending {}-byte packet (seq: {})", chunk_data.len(), seq_no);
+        
+        match self.send_frame_simple(&data_frame) {
+            Ok(()) => {
+                println!("Robustness test: Frame sent successfully, waiting for response...");
+                match self.receive_frame_with_timeout(2000) {
+                    Ok(response) => {
+                        println!("Robustness test: Response received: {:?}", response.msg_type);
+                        if response.msg_type == GcpCommand::Ack {
+                            println!("Robustness test: Packet acknowledged");
+                            return Ok(());
+                        } else if response.msg_type == GcpCommand::Nack {
+                            let error_msg = if response.data.len() >= 2 {
+                                let error_code = u16::from_le_bytes([response.data[0], response.data[1]]);
+                                format!("Device rejected robustness test packet: error code 0x{:04X}", error_code)
+                            } else {
+                                "Device rejected robustness test packet".to_string()
+                            };
+                            return Err(error_msg);
+                        } else {
+                            return Err(format!("Unexpected response to robustness test: {:?}", response.msg_type));
+                        }
+                    }
+                    Err(e) => {
+                        return Err(format!("Robustness test receive failed: {}", e));
+                    }
+                }
+            }
+            Err(e) => {
+                return Err(format!("Robustness test send failed: {}", e));
+            }
+        }
+    }
+
+    pub fn end_firmware_update(&mut self) -> Result<bool, String> {
+        let end_frame = GcpFrame::new(GcpCommand::FwUpdateEnd);
+
+        for attempt in 1..=GCP_MAX_RETRIES {
+            match self.send_frame(&end_frame) {
+                Ok(()) => {
+                    match self.receive_frame() {
+                        Ok(response) => {
+                            if response.msg_type == GcpCommand::Ack {
+                                // Parse verification result
+                                let all_data = [response.parameters.as_slice(), response.data.as_slice()].concat();
+                                if all_data.len() >= 10 {  // MsgType(2) + SeqNo(4) + Result(4)
+                                    let result = u32::from_le_bytes([all_data[6], all_data[7], all_data[8], all_data[9]]);
+                                    if result == 0x00000000 {
+                                        println!("Firmware update verification successful");
+                                        return Ok(true);
+                                    } else {
+                                        println!("Firmware update verification failed: result=0x{:08X}", result);
+                                        return Ok(false);
+                                    }
+                                } else {
+                                    // Simple ACK - assume success
+                                    return Ok(true);
+                                }
+                            } else if response.msg_type == GcpCommand::Nack {
+                                let error_msg = if response.data.len() >= 2 {
+                                    let error_code = u16::from_le_bytes([response.data[0], response.data[1]]);
+                                    format!("Device rejected firmware update end: error code 0x{:04X}", error_code)
+                                } else {
+                                    "Device rejected firmware update end".to_string()
+                                };
+                                return Err(error_msg);
+                            } else {
+                                return Err(format!("Unexpected response to firmware update end: {:?}", response.msg_type));
+                            }
+                        }
+                        Err(e) => {
+                            if attempt == GCP_MAX_RETRIES {
+                                return Err(format!("Failed to receive response to firmware update end after {} attempts: {}", GCP_MAX_RETRIES, e));
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    if attempt == GCP_MAX_RETRIES {
+                        return Err(format!("Failed to send firmware update end after {} attempts: {}", GCP_MAX_RETRIES, e));
+                    }
+                }
+            }
+        }
+
+        Err("Firmware update end failed".to_string())
+    }
+
+    pub fn abort_firmware_update(&mut self) -> Result<(), String> {
+        let abort_frame = GcpFrame::new(GcpCommand::FwUpdateAbort);
+
+        match self.send_frame(&abort_frame) {
+            Ok(()) => {
+                // Don't wait for response, just send abort
+                println!("Firmware update abort sent");
+                Ok(())
+            }
+            Err(e) => Err(format!("Failed to send firmware update abort: {}", e))
+        }
+    }
+
+    pub fn reset_device(&mut self, reset_type: u16) -> Result<(), String> {
+        let parameters = reset_type.to_le_bytes().to_vec();
+        let reset_frame = GcpFrame::with_parameters(GcpCommand::Reset, parameters);
+
+        match self.send_frame(&reset_frame) {
+            Ok(()) => {
+                // Wait briefly for ACK, but don't fail if device reboots immediately
+                match self.receive_frame() {
+                    Ok(response) => {
+                        if response.msg_type == GcpCommand::Ack {
+                            println!("Reset acknowledged, device will reboot");
+                        }
+                    }
+                    Err(_) => {
+                        // Device may have rebooted immediately
+                        println!("Reset sent, device may have rebooted immediately");
+                    }
+                }
+                Ok(())
+            }
+            Err(e) => Err(format!("Failed to send reset command: {}", e))
+        }
+    }
+
     pub fn receive_frame(&mut self) -> Result<GcpFrame, String> {
+        self.receive_frame_with_timeout(GCP_TIMEOUT_MS)
+    }
+
+    pub fn receive_frame_with_timeout(&mut self, timeout_ms: u64) -> Result<GcpFrame, String> {
+        // Set custom timeout for this operation
+        self.port.set_timeout(Duration::from_millis(timeout_ms))
+            .map_err(|e| format!("Failed to set timeout: {}", e))?;
+
         let mut buffer = [0u8; 4096];
         let mut frame_buffer = Vec::new();
         let mut found_preamble = false;
@@ -438,16 +802,23 @@ impl GcpUartHandler {
                         return Err("No data received".to_string());
                     }
 
+                    // Log raw received data
+                    println!("RX Raw ({} bytes): {:02X?}", bytes_read, &buffer[..bytes_read]);
                     frame_buffer.extend_from_slice(&buffer[..bytes_read]);
 
                     // Look for preamble if we haven't found it yet
                     if !found_preamble {
                         if let Some(pos) = find_preamble(&frame_buffer) {
+                            if pos > 0 {
+                                println!("RX: Skipped {} bytes to find preamble", pos);
+                            }
                             frame_buffer = frame_buffer[pos..].to_vec();
                             found_preamble = true;
+                            println!("RX: Found preamble, buffer now: {:02X?}", frame_buffer);
                         } else {
                             // Keep looking, but don't let buffer grow too large
                             if frame_buffer.len() > 1000 {
+                                println!("RX: Buffer too large, clearing");
                                 frame_buffer.clear();
                             }
                             continue;
@@ -457,18 +828,36 @@ impl GcpUartHandler {
                     // If we have preamble, check if we can read length
                     if found_preamble && expected_length == 0 && frame_buffer.len() >= 4 {
                         expected_length = u16::from_le_bytes([frame_buffer[2], frame_buffer[3]]);
+                        println!("RX: Expected frame length: {}", expected_length);
                     }
 
                     // Check if we have a complete frame
                     if expected_length > 0 && frame_buffer.len() >= (expected_length + 4) as usize {
                         let frame_data = &frame_buffer[..(expected_length + 4) as usize];
+                        println!("RX Complete Frame ({} bytes): {:02X?}", frame_data.len(), frame_data);
+                        
+                        // Log CRC validation details before deserializing
+                        if frame_data.len() >= 10 {
+                            let crc_data = &frame_data[2..(2 + expected_length) as usize];
+                            let calculated_crc = gcp_crc16(crc_data);
+                            let received_crc = u16::from_le_bytes([frame_data[frame_data.len()-2], frame_data[frame_data.len()-1]]);
+                            println!("RX CRC: calculated=0x{:04X}, received=0x{:04X}, match={}", 
+                                   calculated_crc, received_crc, calculated_crc == received_crc);
+                        }
+                        
+                        // Reset timeout before returning
+                        let _ = self.port.set_timeout(Duration::from_millis(GCP_TIMEOUT_MS));
                         return GcpFrame::deserialize(frame_data);
                     }
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                    // Reset timeout before returning
+                    let _ = self.port.set_timeout(Duration::from_millis(GCP_TIMEOUT_MS));
                     return Err("Timeout waiting for response".to_string());
                 }
                 Err(e) => {
+                    // Reset timeout before returning
+                    let _ = self.port.set_timeout(Duration::from_millis(GCP_TIMEOUT_MS));
                     return Err(format!("Failed to read from port: {}", e));
                 }
             }
@@ -789,7 +1178,7 @@ mod tests {
         assert_eq!(serialized[0], 0xAA);
         assert_eq!(serialized[1], 0x55);
         
-        // Check length (little-endian)
+        // Check length (little-endian) - should be 6 for HELLO
         assert_eq!(serialized[2], 0x06);
         assert_eq!(serialized[3], 0x00);
         

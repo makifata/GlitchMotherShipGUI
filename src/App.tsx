@@ -2,6 +2,8 @@ import { Button } from '@/components/ui/button';
 import './App.css';
 import BinaryFileViewer from './components/BinaryFileViewer';
 import COMPortSelect from './components/COMPortSelect';
+import DeviceInfoBox from './components/DeviceInfoBox';
+import FirmwareUpdate from './components/FirmwareUpdate';
 import GCPCommunication from './components/GCPCommunication';
 import ProgressBarComponent from './components/ProgressBarComponent';
 import TauriIntegrationComponent from './components/TauriIntegrationComponent';
@@ -9,12 +11,15 @@ import {
   ConnectionProvider,
   useConnection,
 } from './contexts/ConnectionContext';
+import { useConnectionActions } from './hooks/useConnectionActions';
 
 function AppContent() {
   // Theme Control - Change this to switch between light and dark mode
   const isDarkMode = true; // Set to false for light mode, true for dark mode
 
-  const { isConnected, connectedPort, disconnect } = useConnection();
+  const { isConnected, connectedPort, hardwareInfo, firmwareVersionInfo } =
+    useConnection();
+  const { disconnectFromPort } = useConnectionActions();
 
   // Show COM Port Selection Screen
   if (!isConnected) {
@@ -45,14 +50,23 @@ function AppContent() {
           Connected to {connectedPort} - Tauri + React + TypeScript + Tailwind
           CSS + shadcn/ui
         </p>
+
+        {/* Hardware and Firmware Info */}
+        <DeviceInfoBox
+          hardwareInfo={hardwareInfo}
+          firmwareVersionInfo={firmwareVersionInfo}
+        />
         <div className="flex gap-4 justify-center mt-6">
-          <Button variant="destructive" onClick={disconnect}>
+          <Button variant="destructive" onClick={disconnectFromPort}>
             Disconnect
           </Button>
         </div>
       </header>
 
       <main className="app-main">
+        {/* Firmware Update Section */}
+        <FirmwareUpdate />
+
         {/* GCP Communication Section */}
         <GCPCommunication />
 
